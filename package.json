@@ -1,0 +1,52 @@
+{
+  "name": "cynbit-backend-reference",
+  "version": "1.0.0",
+  "description": "Production-grade backend reference implementation and technical audit for Cynbit Technologies",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "migrate": "tsx src/database/migrate.ts"
+  },
+  "keywords": [
+    "cynbit",
+    "backend",
+    "audit",
+    "express",
+    "typescript",
+    "postgresql",
+    "redis",
+    "zod",
+    "helmet"
+  ],
+  "author": "Antigravity Senior Backend Engineer",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "helmet": "^8.0.0",
+    "ioredis": "^5.4.2",
+    "pg": "^8.13.1",
+    "uuid": "^11.0.5",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.7",
+    "@types/pg": "^8.11.11",
+    "@types/supertest": "^6.0.2",
+    "@types/uuid": "^10.0.0",
+    "ioredis-mock": "^8.9.0",
+    "supertest": "^7.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.4"
+  }
+}
