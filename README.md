@@ -12,24 +12,127 @@ This repository contains a **Senior Backend Technical Audit** of Cynbit Technolo
 
 ---
 
-## 1. Project Objective & Problem Statement
+## 1. Project Objective & Discovery Overview
 
 ### Objective
 Inspect Cynbit's publicly accessible web application from a Senior Backend Developer and Security Reviewer perspective, audit observable network requests, response headers, form validation models, and caching mechanics, and deliver an enterprise-grade backend reference implementation that demonstrates how these backend engineering challenges should be solved in production.
 
-### Key Problems Identified on Production Website
-1. **Monolithic Error Feedback & Broken Usability (Issue 3)**:
-   Careers application form submissions return a monolithic, untyped error contract `{ success: false, error?: string }`. When server validation fails (e.g. malformed `portfolioUrl`), the client renders a generic top banner without field-level identification, forcing candidates to manually hunt for errors across 15 input fields.
-2. **Missing Essential Security Headers**:
-   Production omits `Content-Security-Policy` (CSP), `X-Frame-Options` (Clickjacking exposure), `X-Content-Type-Options: nosniff` (MIME sniffing exposure), `Referrer-Policy`, and exposes `X-Powered-By: Next.js`. Top-level document routes serve wildcard CORS (`Access-Control-Allow-Origin: *`).
-3. **Unprotected Write Actions (Issue 1)**:
-   While page navigations are cached at the Vercel edge (`HIT`), publicly accessible write endpoints lack distributed rate limiting (Token Bucket / Sliding Window) with standard `RateLimit-*` and `Retry-After` headers.
-4. **False Delivery Guarantees & Duplicate Ingestion (Issue 4 & 5)**:
-   Contact submissions synchronously assert email delivery without an asynchronous transactional outbox or retry queue, and lack `Idempotency-Key` headers to protect against duplicate form submissions.
+### Core Discovery: Next.js Server Actions & Edge Architecture
+* **Framework & Hosting:** The application is built with **Next.js (App Router)** hosted on **Vercel** serverless edge infrastructure (`Server: Vercel`, `X-Powered-By: Next.js`).
+* **Navigation Architecture:** Route transitions issue React Server Component (`_rsc`) requests (e.g. `GET /[route]?_rsc=[hash]`) hitting Vercel Edge CDN caches (`X-Vercel-Cache: HIT`, `Age: >60,000s`).
+* **Form Mutations:** Client forms execute via Next.js **Server Actions** using `POST` requests bearing cryptographic Action IDs:
+  * Contact Form: `submitInquiry` (`40247ba4465344b3386595bab4303317cdcce907df`)
+  * Newsletter Form: `subscribeToNewsletter` (`40cfc00a772b56a9f2cf23e0d2c13695fd6b5755e3`)
+  * Careers Application Form: `submitCandidateApplication` (`40645a00e04f6854903cf3a65fda4c75ddd7691de9`)
 
 ---
 
-## 2. Technology Stack
+## 2. Identified Errors, Root Causes & Respective Actions (Solutions)
+
+Below is an exhaustive catalog of all 13 errors, vulnerabilities, and usability failures identified during the technical audit of Cynbit Technologies' public website, together with our respective engineering actions and solutions.
+
+### Master Errors & Solutions Summary Table
+
+| Issue ID | Identified Error / Defect | Severity | Observed Production Evidence | Respective Action Taken / Solution | Core Engineering Approach |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **ERR-01** | Unprotected write endpoints (Rate Limiting) | **High** | Server Actions lack `RateLimit-*` & `Retry-After` headers | Redis-backed distributed sliding-window rate limiter | Atomic Redis Lua script with in-memory degraded fallback |
+| **ERR-02** | Client-centric email validation & dirty data | **Medium** | Raw email string passed without normalization | Zod schema with trimming, lowercase & 255-char cap | Schema-level sanitization & `.strict()` parameter defense |
+| **ERR-03** | Monolithic error feedback & URL validation | **High** | Decompiled chunk shows single top banner shake | RFC 9457 Problem Details (`errors: [{ field, msg }]`) | Strict URL scheme validation + error transformation middleware |
+| **ERR-04** | False delivery guarantees & duplicate submits | **Medium** | Synchronous claim; double-click duplicates | Transactional Outbox (`outbox_emails`) + 202 Accepted | Decoupled background queue worker + SHA-256 Idempotency keys |
+| **ERR-05** | Newsletter duplicate mishandling | **Medium** | Risk of unhandled DB unique constraint crash | Idempotent upsert returning friendly 200/201 | PostgreSQL `ON CONFLICT` upsert + double-opt-in tokens |
+| **ERR-06** | Missing Content-Security-Policy (CSP) | **High** | Header omitted across all production routes | Helmet CSP configuration | Restrictive script/connect/frame-ancestors directives |
+| **ERR-07** | Missing Clickjacking protection | **Medium** | Missing `X-Frame-Options` header | Enforced `X-Frame-Options: DENY` | Helmet frameguard blocking unauthorized iframe embedding |
+| **ERR-08** | Missing MIME sniffing defense | **Medium** | Missing `X-Content-Type-Options` header | Enforced `X-Content-Type-Options: nosniff` | Strict MIME type enforcement to prevent script confusion |
+| **ERR-09** | Server software information leakage | **Low** | `X-Powered-By: Next.js` exposed on multiple routes | Header stripped from all responses | Helmet `hidePoweredBy` to prevent framework fingerprinting |
+| **ERR-10** | Overly permissive wildcard CORS | **Medium** | Wildcard `Access-Control-Allow-Origin: *` on documents | Strict CORS origin allowlist | Domain-level allowlist filtering unauthorized web origins |
+| **ERR-11** | Absence of request correlation tracing | **Medium** | Missing `X-Request-Id` correlation header | UUID correlation middleware & JSON logger | Distributed tracing correlation propagated to RFC 9457 errors |
+| **ERR-12** | Missing system health / readiness probe | **Low** | Probing `/health` yields 404 Not Found | Deep health probe inspecting DB & Redis latency | Readiness check assessing connection pool and memory metrics |
+| **ERR-13** | Unbounded payload size / memory bloat risk | **Medium** | No explicit request size ceilings | Strict 100kb payload ceiling on body parsers | Memory exhaustion defense on JSON body parsing |
+
+---
+
+### Deep-Dive: Specific Errors & Respective Actions Taken
+
+#### ERR-01: Public Write Endpoints Lack Origin Distributed Rate Limiting
+* **The Error:** Navigating pages ~100 times in 1 minute showed no rate-limiting warnings. Read navigations are edge-cached by Vercel CDN (`Age: 62338`, `304 Not Modified`), but **public form actions (Contact, Newsletter, Careers) lack origin-level distributed rate limiting**, leaving the system vulnerable to bot flooding, database starvation, and email relay exhaustion.
+* **Respective Action (Solution):** Engineered a distributed sliding-window rate limiter powered by Redis:
+  * Implemented an atomic Redis Lua script executing `ZREMRANGEBYSCORE`, `ZCARD`, and `ZADD` on sorted sets in a single atomic round-trip to prevent Time-of-Check to Time-of-Use (TOCTOU) race conditions in multi-instance clusters.
+  * Emits standard headers: `RateLimit-Limit`, `RateLimit-Remaining`, and `RateLimit-Reset`.
+  * Returns `HTTP 429 Too Many Requests` with an exact `Retry-After: <seconds>` header and RFC 9457 payload when limits are exceeded.
+  * Configured differentiated tiers: Global (300/60s), Contact (5/15m), Newsletter (5/1h), and Careers (10/30m).
+  * Built an automatic in-memory sliding window fallback that activates if Redis suffers network disruption.
+
+#### ERR-02: Client-Centric Email Validation & Dirty Data Persistence
+* **The Error:** Relying on browser HTML5 `<input type="email">` without server-side string normalization allows whitespace-padded emails (e.g., `" alex@domain.com "`), case variations (`"User@Domain.com"`), or oversized strings to enter database records.
+* **Respective Action (Solution):** Created strict Zod schemas with `.trim().toLowerCase().email().max(255)`:
+  * Cleans and normalizes email strings at the schema gateway layer before reaching domain services or repositories.
+  * Bounded string lengths to 255 characters to protect PostgreSQL B-Tree indexes and memory allocations.
+  * Applied `.strict()` across schemas to reject unrecognized fields, defeating parameter pollution attacks.
+
+#### ERR-03: Monolithic Error Feedback & Broken Careers Form URL Validation (Candidate Issue 3)
+* **The Error:** In the 15-field Careers application form, an invalid URL triggers a generic top banner (`"Application Submission Error: Something went wrong. Please check all required fields and try again."`) with **zero field-level identification**, forcing candidates to manually scrutinize every field.
+* **Empirical Code Evidence:** Decompiled from production bundle `page-082725dddd6cb4ac.js`:
+  ```javascript
+  let s = await o(r);
+  s.success
+    ? (m(!0), scrollIntoView())
+    : (b(s.error || "Something went wrong. Please check all required fields and try again."),
+       document.getElementById("application-form")?.scrollIntoView({ behavior: "smooth" }));
+  ```
+  The Server Action returns an untyped primitive `{ success: boolean, error?: string }` without field error breakdown.
+* **Respective Action (Solution):** Adopted the **IETF RFC 9457 Problem Details** standard, returning structured field arrays:
+  ```json
+  {
+    "type": "https://api.cynbit.in/errors/validation-error",
+    "title": "Validation Error",
+    "status": 400,
+    "detail": "Request validation failed. Please check field-level errors.",
+    "instance": "/api/v1/careers/applications",
+    "requestId": "req_8a9b2c3d4e5f",
+    "errors": [
+      {
+        "field": "portfolioUrl",
+        "message": "Please enter a valid URL, such as https://drive.google.com/file/d/... or https://alex.dev"
+      }
+    ]
+  }
+  ```
+  * Custom Zod schemas distinguish mandatory URLs (`portfolioUrl`, `linkedinUrl`) from optional URLs (`professionalProfileUrl`).
+  * Enforces valid HTTP/HTTPS protocol validation (rejecting `javascript:` or `ftp:` schemes).
+  * Central validation middleware maps `ZodError` issues into standard RFC 9457 JSON payloads that any frontend can bind directly to individual form inputs.
+
+#### ERR-04: False Delivery Guarantees & Duplicate Ingestion in Contact Flow
+* **The Error:** Contact submissions synchronously assert: `"INQUIRY RECEIVED. The team has been notified and will contact the user via email."` Synchronously promising email delivery is vulnerable to network timeouts or SMTP relay outages, and double-clicking the submit button creates duplicate entries.
+* **Respective Action (Solution):** Returns `HTTP 202 Accepted` after durable persistence in PostgreSQL, coupled with an **Asynchronous Transactional Outbox Pattern** and `Idempotency-Key` replay verification:
+  * Atomically writes the notification job to an `outbox_emails` table with `status = 'QUEUED'`.
+  * An asynchronous background worker executes delivery with exponential backoff retries (up to 3 attempts), decoupling HTTP ingestion from SMTP availability.
+  * Validates client `Idempotency-Key` headers using SHA-256 payload hashing: replaying identical requests returns cached responses with `isIdempotentReplay: true`, while conflicting payloads sharing the same key are rejected with `HTTP 409 Conflict`.
+
+#### ERR-05: Newsletter Subscription Duplicate Mishandling
+* **The Error:** Submitting an existing email address risks throwing raw PostgreSQL unique constraint violations (`23505 unique_violation`) or leaking internal database table names.
+* **Respective Action (Solution):** Built an idempotent subscription handler:
+  * Uses PostgreSQL upsert patterns (`ON CONFLICT (email) DO UPDATE SET updated_at = NOW()`).
+  * If the email is already subscribed and active, returns friendly `HTTP 200 OK` ("You are already subscribed to the Cynbit Technical Briefing").
+  * If the email is new, persists the subscriber, creates a cryptographically secure confirmation token (`crypto.randomBytes(24).toString('hex')`), and returns `HTTP 201 Created`.
+
+#### ERR-06 to ERR-10: Critical Security Headers, Fingerprinting & CORS Gaps
+* **The Errors:** Missing CSP (ERR-06), missing `X-Frame-Options` (ERR-07), missing `X-Content-Type-Options: nosniff` (ERR-08), `X-Powered-By: Next.js` exposed (ERR-09), and wildcard `Access-Control-Allow-Origin: *` on documents (ERR-10).
+* **Respective Actions (Solutions):**
+  * Configured **Helmet 8** middleware enforcing `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, and a strict CSP (`default-src 'self'; frame-ancestors 'none';`).
+  * Stripped `X-Powered-By` from all responses to prevent framework fingerprinting.
+  * Replaced wildcard CORS with a strict origin allowlist (`CORS_ORIGIN`).
+  * Enforced 2-year HSTS with preload (`Strict-Transport-Security: max-age=63072000; includeSubDomains; preload`).
+
+#### ERR-11 to ERR-13: Observability, Tracing & System Health Deficiencies
+* **The Errors:** Missing request correlation IDs (ERR-11), `/health` returning 404 (ERR-12), and unbounded JSON payload sizes (ERR-13).
+* **Respective Actions (Solutions):**
+  * Built `requestId.ts` middleware injecting `X-Request-Id` UUIDs on every request/response, structured JSON log, and RFC 9457 error instance.
+  * Implemented deep `/health` readiness route reporting PostgreSQL connection pool latency (`SELECT 1`), Redis ping latency, process uptime, and memory usage (RSS MB).
+  * Enforced a strict 100kb payload cap (`express.json({ limit: '100kb' })`) to protect against memory exhaustion attacks.
+
+---
+
+## 3. Technology Stack
 
 * **Runtime:** Node.js v22 (ECMAScript Modules)
 * **Language:** TypeScript 5.7 (Strict type-checking)
@@ -43,7 +146,7 @@ Inspect Cynbit's publicly accessible web application from a Senior Backend Devel
 
 ---
 
-## 3. Architecture & Clean Layering
+## 4. Architecture & Clean Layering
 
 ```
 src/
@@ -78,46 +181,6 @@ src/
 
 ---
 
-## 4. Key Architectural Features
-
-### 4.1 Distributed Sliding-Window Rate Limiter
-Implemented via an atomic Redis Lua script executing in sorted sets (`ZSET`):
-* Evicts timestamps older than current window: `ZREMRANGEBYSCORE key -inf clearBefore`.
-* Evaluates current active requests against policy maximums.
-* If quota breached, calculates exact remaining seconds and returns `HTTP 429 Too Many Requests` with `Retry-After: <sec>` and RFC 9457 problem details.
-* Degrades gracefully to local in-memory sliding window if Redis experiences network failure.
-
-### 4.2 RFC 9457 Structured Field-Level Validation
-When request validation fails, the response is structured so a frontend can highlight exact offending fields:
-```json
-{
-  "type": "https://api.cynbit.in/errors/validation-error",
-  "title": "Validation Error",
-  "status": 400,
-  "detail": "Request validation failed. Please check field-level errors.",
-  "instance": "/api/v1/careers/applications",
-  "requestId": "req_f8e7d6c5",
-  "timestamp": "2026-10-30T06:55:00.000Z",
-  "errors": [
-    {
-      "field": "portfolioUrl",
-      "message": "Please enter a valid URL, such as https://drive.google.com/file/d/... or https://alex.dev"
-    }
-  ]
-}
-```
-
-### 4.3 Idempotency Key Replay Protection
-Prevents duplicate form submissions:
-* Supported via `Idempotency-Key: <UUID>` header.
-* Replays original `202 Accepted` response with `meta.isIdempotentReplay: true` if payload matches.
-* Rejects conflicting payloads reusing an existing key with `HTTP 409 Conflict`.
-
-### 4.4 Transactional Email Outbox Pattern
-Avoids false delivery guarantees by persisting email notifications to `outbox_emails` table before returning `HTTP 202 Accepted`. A decoupled background worker processes jobs with automatic exponential backoff retries.
-
----
-
 ## 5. Local Setup & Execution Guide
 
 ### Prerequisites
@@ -139,36 +202,6 @@ npm install
 Copy `.env.example` to `.env`:
 ```bash
 cp .env.example .env
-```
-
-Key environment settings:
-```ini
-NODE_ENV=development
-PORT=4000
-HOST=0.0.0.0
-CORS_ORIGIN=https://www.cynbit.in,http://localhost:3000
-
-# PostgreSQL
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/cynbit_db
-DB_HOST=localhost
-DB_PORT=5432
-DB_USER=postgres
-DB_PASSWORD=postgres
-DB_NAME=cynbit_db
-
-# Redis
-REDIS_URL=redis://localhost:6379
-
-# Rate Limiting Policies
-RATE_LIMIT_ENABLED=true
-RATE_LIMIT_GLOBAL_MAX=300
-RATE_LIMIT_GLOBAL_WINDOW_SEC=60
-RATE_LIMIT_CONTACT_MAX=5
-RATE_LIMIT_CONTACT_WINDOW_SEC=900
-RATE_LIMIT_NEWSLETTER_MAX=5
-RATE_LIMIT_NEWSLETTER_WINDOW_SEC=3600
-RATE_LIMIT_CAREERS_MAX=10
-RATE_LIMIT_CAREERS_WINDOW_SEC=1800
 ```
 
 ### Spin up PostgreSQL & Redis (Docker)
@@ -198,7 +231,7 @@ npm start
 
 ## 6. Automated Testing
 
-The repository includes a comprehensive automated test suite with **32 tests across 8 test suites**:
+The repository includes a comprehensive automated test suite with **32 tests across 8 test suites** (100% passing):
 
 ```bash
 # Run complete test suite
@@ -295,6 +328,7 @@ curl -i -X POST http://localhost:4000/api/v1/careers/applications \
 ## 8. Documentation Index
 
 The repository includes extensive technical reports in the `docs/` folder:
+* **[Errors, Solutions & Engineering Approaches Guide (`docs/ERRORS_AND_SOLUTIONS_GUIDE.md`)](./docs/ERRORS_AND_SOLUTIONS_GUIDE.md)**: Dedicated plain-text reference guide detailing every defect, empirical root cause, solution contract, and design pattern.
 * **[Technical Audit Report (`docs/technical-audit.md`)](./docs/technical-audit.md)**: In-depth technical audit of Cynbit Technologies' public website, inspecting network requests, headers, Server Actions, edge caching, and security exposures.
 * **[Findings Matrix (`docs/findings-matrix.md`)](./docs/findings-matrix.md)**: Structured matrix mapping all 13 audit findings with evidence, severity, status, impact, and verification methods.
 * **[Architecture Document (`docs/architecture.md`)](./docs/architecture.md)**: Clean architecture diagrams, Redis Lua rate limiting formulas, RFC 9457 error contracts, and database relational models.
